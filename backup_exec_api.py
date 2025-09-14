@@ -1,5 +1,7 @@
 import json
+import os
 import shlex
+import tempfile
 import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Tuple
@@ -119,18 +121,13 @@ def _build_powershell_script(
         "try { $diag.sampleJob = (Get-BEJob | Select-Object -First 1 -ExpandProperty Name) } catch { $diag.sampleJob = $null }",
         "$resultsAll = @()",
         "$attempts = @()",
-        "function Invoke-BECatalogSearch([string]$p, $server = $null, [bool]$dir=$pathIsDir) {",
-        "  if ($server) {",
-        "    if ($recurse -and $dir) { return $server | Search-BECatalog -Path $p -Recurse -PathIsDirectory }",
-        "    elseif ($recurse) { return $server | Search-BECatalog -Path $p -Recurse }",
-        "    elseif ($dir) { return $server | Search-BECatalog -Path $p -PathIsDirectory }",
-        "    else { return $server | Search-BECatalog -Path $p }",
-        "  } else {",
-        "    if ($recurse -and $dir) { return Search-BECatalog -Path $p -Recurse -PathIsDirectory }",
-        "    elseif ($recurse) { return Search-BECatalog -Path $p -Recurse }",
-        "    elseif ($dir) { return Search-BECatalog -Path $p -PathIsDirectory }",
-        "    else { return Search-BECatalog -Path $p }",
-        "  }",
+        "$from = (Get-Date).AddYears(-20)",
+        "$to = (Get-Date).AddDays(1)",
+        "function Invoke-BECatalogSearch([string]$p, $server, [bool]$dir=$pathIsDir) {",
+        "  if ($recurse -and $dir) { return $server | Search-BECatalog -Path $p -Recurse -PathIsDirectory -FromBackupTime $from -ToBackupTime $to }",
+        "  elseif ($recurse) { return $server | Search-BECatalog -Path $p -Recurse -FromBackupTime $from -ToBackupTime $to }",
+        "  elseif ($dir) { return $server | Search-BECatalog -Path $p -PathIsDirectory -FromBackupTime $from -ToBackupTime $to }",
+        "  else { return $server | Search-BECatalog -Path $p -FromBackupTime $from -ToBackupTime $to }",
         "}",
         "function Add-Attempt([string]$name, [string]$pattern, [scriptblock]$block) {",
         "  $a = [ordered]@{ name=$name; pattern=$pattern; success=$true; count=0 }",
@@ -145,14 +142,13 @@ def _build_powershell_script(
         "$dirToggles = @($pathIsDir); if (-not $pathIsDir) { $dirToggles += $true }",
         "foreach ($p in $pathsToTry) {",
         "  foreach ($dir in $dirToggles) {",
-        "  if ($diag.moduleImport.success -and $agentName) {",
-        "    $server = $null",
-        "    try { $server = Get-BEAgentServer -Name $agentName } catch {}",
-        "    if ($server) { Add-Attempt ('agent_pipe_dir=' + $dir) $p { Invoke-BECatalogSearch -p $p -server $server -dir $dir } }",
-        "    else { $attempts += [pscustomobject]@{ name='agent_lookup'; pattern=$p; success=$false; error='Agent not found' } }",
-        "  }",
-        "  Add-Attempt ('direct_dir=' + $dir) $p { Invoke-BECatalogSearch -p $p -dir $dir }",
-        "  Add-Attempt ('all_agents_dir=' + $dir) $p { Get-BEAgentServer | ForEach-Object { Invoke-BECatalogSearch -p $p -server $_ -dir $dir } }",
+        "    if ($diag.moduleImport.success -and $agentName) {",
+        "      $server = $null",
+        "      try { $server = Get-BEAgentServer -Name $agentName } catch {}",
+        "      if ($server) { Add-Attempt ('agent_dir=' + $dir) $p { Invoke-BECatalogSearch -p $p -server $server -dir $dir } }",
+        "      else { $attempts += [pscustomobject]@{ name='agent_lookup'; pattern=$p; success=$false; error='Agent not found' } }",
+        "    }",
+        "    Add-Attempt ('all_agents_dir=' + $dir) $p { Get-BEAgentServer | ForEach-Object { Invoke-BECatalogSearch -p $p -server $_ -dir $dir } }",
         "  }",
         "}",
         "$diag.attempts = $attempts",
@@ -163,38 +159,44 @@ def _build_powershell_script(
 
 
 def _run_powershell(script: str, timeout_seconds: int = 120) -> Tuple[int, str, str, str]:
-    """Run the provided PowerShell script and return (code, stdout, stderr, used_binary)."""
-    # Prefer powershell.exe on Windows. If only PowerShell 7 is available (pwsh),
-    # the caller may adjust this binary; we try powershell first.
+    """Run the provided PowerShell script via a temporary .ps1 file and return (code, stdout, stderr, used_binary)."""
     used_binary = "powershell.exe"
-    cmd = [
-        used_binary,
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-Command",
-        script,
-    ]
-
+    # Write script to a temp .ps1 file to avoid -Command quoting issues
+    with tempfile.NamedTemporaryFile("w", suffix=".ps1", delete=False, encoding="utf-8") as tf:
+        tf.write(script)
+        temp_path = tf.name
     try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-        )
-        return proc.returncode, proc.stdout, proc.stderr, used_binary
-    except FileNotFoundError:
-        # Fallback to pwsh if powershell.exe is not present (e.g., PowerShell 7 only)
-        used_binary = "pwsh"
-        cmd[0] = used_binary
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-        )
-        return proc.returncode, proc.stdout, proc.stderr, used_binary
+        cmd = [
+            used_binary,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            temp_path,
+        ]
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+            )
+            return proc.returncode, proc.stdout, proc.stderr, used_binary
+        except FileNotFoundError:
+            used_binary = "pwsh"
+            cmd[0] = used_binary
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+            )
+            return proc.returncode, proc.stdout, proc.stderr, used_binary
+    finally:
+        try:
+            os.remove(temp_path)
+        except Exception:
+            pass
 
 
 def search_catalog(
