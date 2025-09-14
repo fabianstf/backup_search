@@ -1,0 +1,206 @@
+import json
+import shlex
+import subprocess
+import sys
+from typing import Any, Dict, List, Optional, Tuple
+
+from flask import Flask, jsonify, request, render_template, send_from_directory
+
+
+app = Flask(__name__)
+
+
+DEFAULT_BEMCLI_MODULE_PATH = r"C:\\Program Files\\Veritas\\Backup Exec\\Modules\\PowerShell3\\BEMCLI"
+
+
+def _escape_for_single_quoted_powershell(value: str) -> str:
+    """Escape a Python string for safe insertion into a single-quoted PowerShell string.
+
+    PowerShell single-quoted strings escape a single quote by doubling it.
+    """
+    return value.replace("'", "''")
+
+
+def _build_powershell_script(
+    path: str,
+    agent_server: Optional[str] = None,
+    module_path: Optional[str] = None,
+) -> str:
+    """Build the PowerShell script to import BEMCLI and run a catalog search.
+
+    Returns a string that is executed with `powershell.exe -NoProfile -ExecutionPolicy Bypass -Command <script>`.
+    """
+
+    ps_module_path = module_path or DEFAULT_BEMCLI_MODULE_PATH
+
+    ps_escaped_path = _escape_for_single_quoted_powershell(path)
+    ps_escaped_agent = _escape_for_single_quoted_powershell(agent_server) if agent_server else ""
+    ps_escaped_module = _escape_for_single_quoted_powershell(ps_module_path) if ps_module_path else ""
+
+    # Compose the PowerShell logic. We try the full module path first (common on BE servers),
+    # and fall back to `Import-Module BEMCLI` if not found.
+    lines: List[str] = [
+        "$ErrorActionPreference = 'Stop'",
+        "$ProgressPreference = 'SilentlyContinue'",
+        f"$modulePath = '{ps_escaped_module}'",
+        "if ($modulePath -and (Test-Path $modulePath)) {",
+        "  Import-Module $modulePath",
+        "} else {",
+        "  Import-Module BEMCLI",
+        "}",
+        f"$queryPath = '{ps_escaped_path}'",
+    ]
+
+    if ps_escaped_agent:
+        lines += [
+            f"$agentName = '{ps_escaped_agent}'",
+            "$server = Get-BEAgentServer -Name $agentName",
+            "$results = $server | Search-BECatalog -Path $queryPath",
+        ]
+    else:
+        lines += [
+            "$results = Search-BECatalog -Path $queryPath",
+        ]
+
+    # Always emit JSON; wrap in array to ensure [] instead of null when no results.
+    lines += [
+        "@($results) | ConvertTo-Json -Depth 6",
+    ]
+
+    return "; ".join(lines)
+
+
+def _run_powershell(script: str, timeout_seconds: int = 120) -> Tuple[int, str, str]:
+    """Run the provided PowerShell script and return (code, stdout, stderr)."""
+    # Prefer powershell.exe on Windows. If only PowerShell 7 is available (pwsh),
+    # the caller may adjust this binary; we try powershell first.
+    cmd = [
+        "powershell.exe",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        script,
+    ]
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+    except FileNotFoundError:
+        # Fallback to pwsh if powershell.exe is not present (e.g., PowerShell 7 only)
+        cmd[0] = "pwsh"
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+
+
+def search_catalog(
+    path: str,
+    agent_server: Optional[str] = None,
+    module_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Search the Backup Exec catalog for a given path using BEMCLI.
+
+    Returns a dict with keys: success (bool), results (list), error (str|None).
+    """
+    ps_script = _build_powershell_script(path=path, agent_server=agent_server, module_path=module_path)
+    code, out, err = _run_powershell(ps_script)
+
+    if code != 0:
+        return {"success": False, "results": [], "error": err.strip() or f"PowerShell exited with code {code}"}
+
+    stdout = out.strip()
+    if not stdout:
+        # No output translates to empty result set
+        return {"success": True, "results": [], "error": None}
+
+    # PowerShell ConvertTo-Json may emit non-JSON preamble in rare cases; attempt to parse robustly.
+    try:
+        parsed = json.loads(stdout)
+    except json.JSONDecodeError:
+        # Try to locate the first JSON array/object in the output
+        first_bracket = min((i for i in [stdout.find("["), stdout.find("{")] if i != -1), default=-1)
+        if first_bracket != -1:
+            try:
+                parsed = json.loads(stdout[first_bracket:])
+            except json.JSONDecodeError:
+                return {"success": False, "results": [], "error": "Failed to parse JSON from PowerShell output."}
+        else:
+            return {"success": False, "results": [], "error": "No JSON output from PowerShell."}
+
+    # Normalize to list
+    results_list: List[Dict[str, Any]]
+    if isinstance(parsed, list):
+        results_list = parsed
+    elif parsed is None:
+        results_list = []
+    else:
+        results_list = [parsed]
+
+    return {"success": True, "results": results_list, "error": None}
+
+
+@app.get("/search")
+def http_search() -> Any:
+    """HTTP endpoint to search the Backup Exec catalog.
+
+    Query params:
+      - path (required): The path or wildcard pattern to search (e.g., C:\\Data\\Projects\\*).
+      - agent (optional): Name of the Agent Server to scope the search.
+      - modulepath (optional): Full path to the BEMCLI module folder.
+    """
+    query_path = request.args.get("path", type=str)
+    if not query_path:
+        return jsonify({"error": "Missing required query parameter 'path'"}), 400
+
+    agent = request.args.get("agent", type=str)
+    module_path = request.args.get("modulepath", type=str)
+
+    result = search_catalog(path=query_path, agent_server=agent, module_path=module_path)
+    status_code = 200 if result.get("success") else 500
+    payload = {
+        "success": result["success"],
+        "count": len(result.get("results", [])),
+        "results": result.get("results", []),
+        "error": result.get("error"),
+    }
+    return jsonify(payload), status_code
+
+
+@app.get("/health")
+def http_health() -> Any:
+    return jsonify({"status": "ok"})
+
+
+@app.get("/")
+def http_index() -> Any:
+    return render_template("index.html")
+
+
+if __name__ == "__main__":
+    # Example: python backup_exec_api.py --path "C:\\Data\\*"
+    if len(sys.argv) > 1 and sys.argv[1] == "--path" and len(sys.argv) > 2:
+        path_arg = sys.argv[2]
+        agent_arg = None
+        module_arg = None
+        # Optional flags
+        for i, token in enumerate(sys.argv):
+            if token == "--agent" and i + 1 < len(sys.argv):
+                agent_arg = sys.argv[i + 1]
+            if token == "--modulepath" and i + 1 < len(sys.argv):
+                module_arg = sys.argv[i + 1]
+        res = search_catalog(path=path_arg, agent_server=agent_arg, module_path=module_arg)
+        print(json.dumps(res, indent=2))
+    else:
+        app.run(host="0.0.0.0", port=5000)
+
+
