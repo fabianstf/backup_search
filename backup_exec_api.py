@@ -24,7 +24,6 @@ def _escape_for_single_quoted_powershell(value: str) -> str:
 def _build_powershell_script(
     path: str,
     agent_server: Optional[str] = None,
-    module_path: Optional[str] = None,
     recurse: bool = False,
     path_is_directory: bool = False,
 ) -> str:
@@ -33,7 +32,7 @@ def _build_powershell_script(
     Returns a string that is executed with `powershell.exe -NoProfile -ExecutionPolicy Bypass -Command <script>`.
     """
 
-    ps_module_path = module_path or DEFAULT_BEMCLI_MODULE_PATH
+    ps_module_path = DEFAULT_BEMCLI_MODULE_PATH
 
     ps_escaped_path = _escape_for_single_quoted_powershell(path)
     ps_escaped_agent = _escape_for_single_quoted_powershell(agent_server) if agent_server else ""
@@ -60,7 +59,7 @@ def _build_powershell_script(
         "  $script:moduleAttempts += [pscustomobject]$a",
         "  return [bool]$m",
         "}",
-        "# 1) Explicit path if provided",
+        "# 1) Explicit path (hardcoded)",
         "if ($modulePath -and (Test-Path $modulePath)) { Add-ImportAttempt 'explicitPath' { Import-Module $modulePath -Force } | Out-Null }",
         "# 2) By name (if BEMCLI is on PSModulePath)",
         "if (-not (Get-Module BEMCLI -ErrorAction SilentlyContinue)) { Add-ImportAttempt 'byName' { Import-Module BEMCLI -Force } | Out-Null }",
@@ -201,7 +200,6 @@ def _run_powershell(script: str, timeout_seconds: int = 120) -> Tuple[int, str, 
 def search_catalog(
     path: str,
     agent_server: Optional[str] = None,
-    module_path: Optional[str] = None,
     recurse: bool = False,
     path_is_directory: bool = False,
 ) -> Dict[str, Any]:
@@ -212,7 +210,6 @@ def search_catalog(
     ps_script = _build_powershell_script(
         path=path,
         agent_server=agent_server,
-        module_path=module_path,
         recurse=recurse,
         path_is_directory=path_is_directory,
     )
@@ -293,21 +290,18 @@ def http_search() -> Any:
     Query params:
       - path (required): The path or wildcard pattern to search (e.g., C:\\Data\\Projects\\*).
       - agent (optional): Name of the Agent Server to scope the search.
-      - modulepath (optional): Full path to the BEMCLI module folder.
     """
     query_path = request.args.get("path", type=str)
     if not query_path:
         return jsonify({"error": "Missing required query parameter 'path'"}), 400
 
     agent = request.args.get("agent", type=str)
-    module_path = request.args.get("modulepath", type=str)
     recurse = request.args.get("recurse", default="false", type=str).lower() in ("1", "true", "yes", "on")
     path_is_dir = request.args.get("isdir", default="false", type=str).lower() in ("1", "true", "yes", "on")
 
     result = search_catalog(
         path=query_path,
         agent_server=agent,
-        module_path=module_path,
         recurse=recurse,
         path_is_directory=path_is_dir,
     )

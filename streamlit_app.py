@@ -13,12 +13,10 @@ st.caption("Search the Backup Exec catalog by path using BEMCLI")
 
 with st.form("search_form"):
     path = st.text_input("Path (use wildcards like *)", value=r"C:\\Data\\Projects\\*")
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     with col1:
         agent = st.text_input("Agent (optional)", value="")
     with col2:
-        modulepath = st.text_input("BEMCLI module path (optional)", value=DEFAULT_BEMCLI_MODULE_PATH)
-    with col3:
         show_debug = st.checkbox("Show debug info", value=True)
     col4, col5 = st.columns(2)
     with col4:
@@ -35,7 +33,6 @@ if submitted:
             result: Dict[str, Any] = search_catalog(
                 path=path.strip(),
                 agent_server=agent.strip() or None,
-                module_path=modulepath.strip() or None,
                 recurse=recurse,
                 path_is_directory=is_dir,
             )
