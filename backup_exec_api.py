@@ -4,7 +4,7 @@ import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
-from flask import Flask, jsonify, request, render_template, send_from_directory
+from flask import Flask, jsonify, request
 
 
 app = Flask(__name__)
@@ -26,7 +26,7 @@ def _build_powershell_script(
     agent_server: Optional[str] = None,
     module_path: Optional[str] = None,
 ) -> str:
-    """Build the PowerShell script to import BEMCLI and run a catalog search.
+    """Build the PowerShell script to import BEMCLI and run a catalog search with diagnostics.
 
     Returns a string that is executed with `powershell.exe -NoProfile -ExecutionPolicy Bypass -Command <script>`.
     """
@@ -37,45 +37,85 @@ def _build_powershell_script(
     ps_escaped_agent = _escape_for_single_quoted_powershell(agent_server) if agent_server else ""
     ps_escaped_module = _escape_for_single_quoted_powershell(ps_module_path) if ps_module_path else ""
 
-    # Compose the PowerShell logic. We try the full module path first (common on BE servers),
-    # and fall back to `Import-Module BEMCLI` if not found.
+    # Compose the PowerShell logic with diagnostics and multiple attempts/patterns.
     lines: List[str] = [
         "$ErrorActionPreference = 'Stop'",
         "$ProgressPreference = 'SilentlyContinue'",
         f"$modulePath = '{ps_escaped_module}'",
-        "if ($modulePath -and (Test-Path $modulePath)) {",
-        "  Import-Module $modulePath",
-        "} else {",
-        "  Import-Module BEMCLI",
+        "# Diagnostics container",
+        "$diag = [ordered]@{}",
+        "$diag.PSVersion = $PSVersionTable.PSVersion.ToString()",
+        "$diag.PSEdition = $PSVersionTable.PSEdition",
+        "$diag.MachineName = $env:COMPUTERNAME",
+        "# Import BEMCLI",
+        "$diag.moduleImport = [ordered]@{ tried=$modulePath }",
+        "try {",
+        "  if ($modulePath -and (Test-Path $modulePath)) {",
+        "    Import-Module $modulePath -Force",
+        "  } else {",
+        "    Import-Module BEMCLI -Force",
+        "  }",
+        "  $mod = Get-Module BEMCLI",
+        "  $diag.moduleImport.success = $true",
+        "  $diag.moduleImport.loadedPath = $mod.Path",
+        "  $diag.moduleImport.version = $mod.Version.ToString()",
+        "} catch {",
+        "  $diag.moduleImport.success = $false",
+        "  $diag.moduleImport.error = $_.Exception.Message",
         "}",
         f"$queryPath = '{ps_escaped_path}'",
-    ]
-
-    if ps_escaped_agent:
-        lines += [
-            f"$agentName = '{ps_escaped_agent}'",
-            "$server = Get-BEAgentServer -Name $agentName",
-            "$results = $server | Search-BECatalog -Path $queryPath",
-        ]
-    else:
-        lines += [
-            "$results = Search-BECatalog -Path $queryPath",
-        ]
-
-    # Always emit JSON; wrap in array to ensure [] instead of null when no results.
-    lines += [
-        "@($results) | ConvertTo-Json -Depth 6",
+        f"$agentName = '{ps_escaped_agent}'",
+        "$diag.queryPath = $queryPath",
+        "$diag.agentRequested = $agentName",
+        "$diag.identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name",
+        "$diag.hasSearchBECatalog = [bool](Get-Command Search-BECatalog -ErrorAction SilentlyContinue)",
+        "# Determine patterns to try",
+        "$pathsToTry = @()",
+        "$pathsToTry += $queryPath",
+        "if (-not ($queryPath -match '[*?]') -and $queryPath -ne '') {",
+        "  $pathsToTry += ($queryPath + '*')",
+        "  $pathsToTry += ('*' + $queryPath + '*')",
+        "}",
+        "if ($queryPath -eq '') { $pathsToTry = @('*') }",
+        "$diag.pathsToTry = $pathsToTry",
+        "# Collect available agents (names only)",
+        "try { $diag.agentsAvailable = (Get-BEAgentServer | Select-Object -ExpandProperty Name) } catch { $diag.agentsAvailable = @(); }",
+        "$resultsAll = @()",
+        "$attempts = @()",
+        "function Add-Attempt([string]$name, [string]$pattern, [scriptblock]$block) {",
+        "  $a = [ordered]@{ name=$name; pattern=$pattern; success=$true; count=0 }",
+        "  try {",
+        "    $r = & $block",
+        "    if ($r) { $arr = @($r); $resultsAll += $arr; $a.count = $arr.Count }",
+        "  } catch {",
+        "    $a.success = $false; $a.error = $_.Exception.Message",
+        "  }",
+        "  $attempts += [pscustomobject]$a",
+        "}",
+        "foreach ($p in $pathsToTry) {",
+        "  if ($diag.moduleImport.success -and $agentName) {",
+        "    $server = $null",
+        "    try { $server = Get-BEAgentServer -Name $agentName } catch {}",
+        "    if ($server) { Add-Attempt 'agent_pipe' $p { $server | Search-BECatalog -Path $p } }",
+        "    else { $attempts += [pscustomobject]@{ name='agent_lookup'; pattern=$p; success=$false; error='Agent not found' } }",
+        "  }",
+        "  Add-Attempt 'direct' $p { Search-BECatalog -Path $p }",
+        "  Add-Attempt 'all_agents' $p { Get-BEAgentServer | ForEach-Object { $_ | Search-BECatalog -Path $p } }",
+        "}",
+        "$diag.attempts = $attempts",
+        "[pscustomobject]@{ diagnostics = $diag; results = @($resultsAll) } | ConvertTo-Json -Depth 6",
     ]
 
     return "; ".join(lines)
 
 
-def _run_powershell(script: str, timeout_seconds: int = 120) -> Tuple[int, str, str]:
-    """Run the provided PowerShell script and return (code, stdout, stderr)."""
+def _run_powershell(script: str, timeout_seconds: int = 120) -> Tuple[int, str, str, str]:
+    """Run the provided PowerShell script and return (code, stdout, stderr, used_binary)."""
     # Prefer powershell.exe on Windows. If only PowerShell 7 is available (pwsh),
     # the caller may adjust this binary; we try powershell first.
+    used_binary = "powershell.exe"
     cmd = [
-        "powershell.exe",
+        used_binary,
         "-NoProfile",
         "-ExecutionPolicy",
         "Bypass",
@@ -90,17 +130,18 @@ def _run_powershell(script: str, timeout_seconds: int = 120) -> Tuple[int, str, 
             text=True,
             timeout=timeout_seconds,
         )
-        return proc.returncode, proc.stdout, proc.stderr
+        return proc.returncode, proc.stdout, proc.stderr, used_binary
     except FileNotFoundError:
         # Fallback to pwsh if powershell.exe is not present (e.g., PowerShell 7 only)
-        cmd[0] = "pwsh"
+        used_binary = "pwsh"
+        cmd[0] = used_binary
         proc = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
         )
-        return proc.returncode, proc.stdout, proc.stderr
+        return proc.returncode, proc.stdout, proc.stderr, used_binary
 
 
 def search_catalog(
@@ -113,10 +154,18 @@ def search_catalog(
     Returns a dict with keys: success (bool), results (list), error (str|None).
     """
     ps_script = _build_powershell_script(path=path, agent_server=agent_server, module_path=module_path)
-    code, out, err = _run_powershell(ps_script)
+    code, out, err, used_bin = _run_powershell(ps_script)
 
     if code != 0:
-        return {"success": False, "results": [], "error": err.strip() or f"PowerShell exited with code {code}"}
+        return {
+            "success": False,
+            "results": [],
+            "error": err.strip() or f"PowerShell exited with code {code}",
+            "diagnostics": {
+                "ps": {"binary": used_bin, "exit_code": code, "stderr": err, "script": ps_script},
+                "raw_stdout": out,
+            },
+        }
 
     stdout = out.strip()
     if not stdout:
@@ -133,20 +182,46 @@ def search_catalog(
             try:
                 parsed = json.loads(stdout[first_bracket:])
             except json.JSONDecodeError:
-                return {"success": False, "results": [], "error": "Failed to parse JSON from PowerShell output."}
+                return {
+                    "success": False,
+                    "results": [],
+                    "error": "Failed to parse JSON from PowerShell output.",
+                    "diagnostics": {
+                        "ps": {"binary": used_bin, "exit_code": code, "stderr": err, "script": ps_script},
+                        "raw_stdout": out,
+                    },
+                }
         else:
-            return {"success": False, "results": [], "error": "No JSON output from PowerShell."}
+            return {
+                "success": False,
+                "results": [],
+                "error": "No JSON output from PowerShell.",
+                "diagnostics": {
+                    "ps": {"binary": used_bin, "exit_code": code, "stderr": err, "script": ps_script},
+                    "raw_stdout": out,
+                },
+            }
+    # Expecting an object with keys 'results' and 'diagnostics'
+    diagnostics: Dict[str, Any] = {}
+    results_payload: Any = parsed
+    if isinstance(parsed, dict) and "results" in parsed:
+        results_payload = parsed.get("results")
+        diagnostics = parsed.get("diagnostics") or {}
 
     # Normalize to list
     results_list: List[Dict[str, Any]]
-    if isinstance(parsed, list):
-        results_list = parsed
-    elif parsed is None:
+    if isinstance(results_payload, list):
+        results_list = results_payload
+    elif results_payload is None:
         results_list = []
     else:
-        results_list = [parsed]
+        results_list = [results_payload]
 
-    return {"success": True, "results": results_list, "error": None}
+    # Attach ps exec diagnostics too
+    diagnostics = diagnostics or {}
+    diagnostics["ps"] = {"binary": used_bin, "exit_code": code}
+
+    return {"success": True, "results": results_list, "error": None, "diagnostics": diagnostics}
 
 
 @app.get("/search")
@@ -172,6 +247,7 @@ def http_search() -> Any:
         "count": len(result.get("results", [])),
         "results": result.get("results", []),
         "error": result.get("error"),
+        "diagnostics": result.get("diagnostics"),
     }
     return jsonify(payload), status_code
 
@@ -181,9 +257,7 @@ def http_health() -> Any:
     return jsonify({"status": "ok"})
 
 
-@app.get("/")
-def http_index() -> Any:
-    return render_template("index.html")
+ # Root route removed (no HTML UI)
 
 
 if __name__ == "__main__":
