@@ -20,6 +20,11 @@ with st.form("search_form"):
         modulepath = st.text_input("BEMCLI module path (optional)", value=DEFAULT_BEMCLI_MODULE_PATH)
     with col3:
         show_debug = st.checkbox("Show debug info", value=True)
+    col4, col5 = st.columns(2)
+    with col4:
+        recurse = st.checkbox("Recurse subfolders (-Recurse)", value=False)
+    with col5:
+        is_dir = st.checkbox("Path is directory (-PathIsDirectory)", value=False)
     submitted = st.form_submit_button("Search")
 
 if submitted:
@@ -31,6 +36,8 @@ if submitted:
                 path=path.strip(),
                 agent_server=agent.strip() or None,
                 module_path=modulepath.strip() or None,
+                recurse=recurse,
+                path_is_directory=is_dir,
             )
 
         if not result.get("success"):
@@ -42,7 +49,6 @@ if submitted:
             if len(items) == 0:
                 st.info("No results found.")
             else:
-                # Common BEMCLI Search-BECatalog fields
                 cols = [
                     ("Resource", "ResourceName"),
                     ("Name", "Name"),
@@ -71,34 +77,6 @@ if submitted:
             st.divider()
             st.subheader("Diagnostics")
             diag = result.get("diagnostics") or {}
-            st.write("PowerShell:")
-            st.json({
-                "binary": (diag.get("ps") or {}).get("binary"),
-                "exit_code": (diag.get("ps") or {}).get("exit_code"),
-            })
-            # Include script and stderr if present
-            ps_script = (diag.get("ps") or {}).get("script")
-            ps_stderr = (diag.get("ps") or {}).get("stderr")
-            raw_stdout = diag.get("raw_stdout")
-            if ps_script:
-                with st.expander("PowerShell script"):
-                    st.code(ps_script, language="powershell")
-            if ps_stderr:
-                with st.expander("PowerShell stderr"):
-                    st.code(ps_stderr)
-            if raw_stdout:
-                with st.expander("Raw PowerShell stdout"):
-                    st.code(raw_stdout)
-            # Show any attempts from the PS diagnostics if available
-            attempts = (diag.get("attempts") if isinstance(diag, dict) else None)
-            # If attempts are nested under diagnostics from PS object
-            if not attempts and isinstance(diag, dict) and "attempts" in diag:
-                attempts = diag.get("attempts")
-            # If full diagnostics object from PS included
-            if isinstance(diag, dict) and "diagnostics" in diag and not attempts:
-                attempts = (diag.get("diagnostics") or {}).get("attempts")
-            if attempts:
-                st.write("Search attempts:")
-                st.json(attempts)
+            st.json(diag)
 
 

@@ -25,6 +25,8 @@ def _build_powershell_script(
     path: str,
     agent_server: Optional[str] = None,
     module_path: Optional[str] = None,
+    recurse: bool = False,
+    path_is_directory: bool = False,
 ) -> str:
     """Build the PowerShell script to import BEMCLI and run a catalog search with diagnostics.
 
@@ -69,6 +71,10 @@ def _build_powershell_script(
         "$diag.agentRequested = $agentName",
         "$diag.identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name",
         "$diag.hasSearchBECatalog = [bool](Get-Command Search-BECatalog -ErrorAction SilentlyContinue)",
+        f"$recurse = ${str(recurse).lower()}",
+        f"$pathIsDir = ${str(path_is_directory).lower()}",
+        "$diag.recurse = $recurse",
+        "$diag.pathIsDirectory = $pathIsDir",
         "# Determine patterns to try",
         "$pathsToTry = @()",
         "$pathsToTry += $queryPath",
@@ -80,8 +86,24 @@ def _build_powershell_script(
         "$diag.pathsToTry = $pathsToTry",
         "# Collect available agents (names only)",
         "try { $diag.agentsAvailable = (Get-BEAgentServer | Select-Object -ExpandProperty Name) } catch { $diag.agentsAvailable = @(); }",
+        "# Basic environment validation",
+        "try { $diag.backupSetCount = (Get-BEBackupSet | Measure-Object).Count } catch { $diag.backupSetCount = $null }",
+        "try { $diag.sampleJob = (Get-BEJob | Select-Object -First 1 -ExpandProperty Name) } catch { $diag.sampleJob = $null }",
         "$resultsAll = @()",
         "$attempts = @()",
+        "function Invoke-BECatalogSearch([string]$p, $server = $null) {",
+        "  if ($server) {",
+        "    if ($recurse -and $pathIsDir) { return $server | Search-BECatalog -Path $p -Recurse -PathIsDirectory }",
+        "    elseif ($recurse) { return $server | Search-BECatalog -Path $p -Recurse }",
+        "    elseif ($pathIsDir) { return $server | Search-BECatalog -Path $p -PathIsDirectory }",
+        "    else { return $server | Search-BECatalog -Path $p }",
+        "  } else {",
+        "    if ($recurse -and $pathIsDir) { return Search-BECatalog -Path $p -Recurse -PathIsDirectory }",
+        "    elseif ($recurse) { return Search-BECatalog -Path $p -Recurse }",
+        "    elseif ($pathIsDir) { return Search-BECatalog -Path $p -PathIsDirectory }",
+        "    else { return Search-BECatalog -Path $p }",
+        "  }",
+        "}",
         "function Add-Attempt([string]$name, [string]$pattern, [scriptblock]$block) {",
         "  $a = [ordered]@{ name=$name; pattern=$pattern; success=$true; count=0 }",
         "  try {",
@@ -96,11 +118,11 @@ def _build_powershell_script(
         "  if ($diag.moduleImport.success -and $agentName) {",
         "    $server = $null",
         "    try { $server = Get-BEAgentServer -Name $agentName } catch {}",
-        "    if ($server) { Add-Attempt 'agent_pipe' $p { $server | Search-BECatalog -Path $p } }",
+        "    if ($server) { Add-Attempt 'agent_pipe' $p { Invoke-BECatalogSearch -p $p -server $server } }",
         "    else { $attempts += [pscustomobject]@{ name='agent_lookup'; pattern=$p; success=$false; error='Agent not found' } }",
         "  }",
-        "  Add-Attempt 'direct' $p { Search-BECatalog -Path $p }",
-        "  Add-Attempt 'all_agents' $p { Get-BEAgentServer | ForEach-Object { $_ | Search-BECatalog -Path $p } }",
+        "  Add-Attempt 'direct' $p { Invoke-BECatalogSearch -p $p }",
+        "  Add-Attempt 'all_agents' $p { Get-BEAgentServer | ForEach-Object { Invoke-BECatalogSearch -p $p -server $_ } }",
         "}",
         "$diag.attempts = $attempts",
         "[pscustomobject]@{ diagnostics = $diag; results = @($resultsAll) } | ConvertTo-Json -Depth 6",
@@ -148,12 +170,20 @@ def search_catalog(
     path: str,
     agent_server: Optional[str] = None,
     module_path: Optional[str] = None,
+    recurse: bool = False,
+    path_is_directory: bool = False,
 ) -> Dict[str, Any]:
     """Search the Backup Exec catalog for a given path using BEMCLI.
 
     Returns a dict with keys: success (bool), results (list), error (str|None).
     """
-    ps_script = _build_powershell_script(path=path, agent_server=agent_server, module_path=module_path)
+    ps_script = _build_powershell_script(
+        path=path,
+        agent_server=agent_server,
+        module_path=module_path,
+        recurse=recurse,
+        path_is_directory=path_is_directory,
+    )
     code, out, err, used_bin = _run_powershell(ps_script)
 
     if code != 0:
@@ -239,8 +269,16 @@ def http_search() -> Any:
 
     agent = request.args.get("agent", type=str)
     module_path = request.args.get("modulepath", type=str)
+    recurse = request.args.get("recurse", default="false", type=str).lower() in ("1", "true", "yes", "on")
+    path_is_dir = request.args.get("isdir", default="false", type=str).lower() in ("1", "true", "yes", "on")
 
-    result = search_catalog(path=query_path, agent_server=agent, module_path=module_path)
+    result = search_catalog(
+        path=query_path,
+        agent_server=agent,
+        module_path=module_path,
+        recurse=recurse,
+        path_is_directory=path_is_dir,
+    )
     status_code = 200 if result.get("success") else 500
     payload = {
         "success": result["success"],
