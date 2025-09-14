@@ -61,8 +61,12 @@ def _build_powershell_script(
         "  $script:moduleAttempts += [pscustomobject]$a",
         "  return [bool]$m",
         "}",
-        "# 1) Explicit path (hardcoded)",
-        "if ($modulePath -and (Test-Path $modulePath)) { Add-ImportAttempt 'explicitPath' { Import-Module $modulePath -Force } | Out-Null }",
+        "# 1) Explicit path (hardcoded) — try manifest then folder",
+        "if ($modulePath -and (Test-Path $modulePath)) {",
+        "  $manifest = Join-Path $modulePath 'BEMCLI.psd1'",
+        "  if (Test-Path $manifest) { Add-ImportAttempt 'explicitManifest' { Import-Module $manifest -Force } | Out-Null }",
+        "  if (-not (Get-Module BEMCLI -ErrorAction SilentlyContinue)) { Add-ImportAttempt 'explicitFolder' { Import-Module $modulePath -Force } | Out-Null }",
+        "}",
         "# 2) By name (if BEMCLI is on PSModulePath)",
         "if (-not (Get-Module BEMCLI -ErrorAction SilentlyContinue)) { Add-ImportAttempt 'byName' { Import-Module BEMCLI -Force } | Out-Null }",
         "# 3) Registry install path",
@@ -152,6 +156,9 @@ def _build_powershell_script(
         "  }",
         "}",
         "$diag.attempts = $attempts",
+        "# Emit diagnostics to stderr too for visibility",
+        "$diagJson = [pscustomobject]@{ diagnostics = $diag; resultsCount = @($resultsAll).Count } | ConvertTo-Json -Depth 6",
+        "[Console]::Error.WriteLine($diagJson)",
         "[pscustomobject]@{ diagnostics = $diag; results = @($resultsAll) } | ConvertTo-Json -Depth 6",
     ]
 
@@ -280,7 +287,7 @@ def search_catalog(
 
     # Attach ps exec diagnostics too
     diagnostics = diagnostics or {}
-    diagnostics["ps"] = {"binary": used_bin, "exit_code": code}
+    diagnostics["ps"] = {"binary": used_bin, "exit_code": code, "stderr": err}
 
     return {"success": True, "results": results_list, "error": None, "diagnostics": diagnostics}
 
